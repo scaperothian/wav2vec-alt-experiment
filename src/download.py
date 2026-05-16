@@ -17,8 +17,8 @@ _DOWNLOAD_DIRNAME = "downloaded"
 
 
 def _find_local_checkpoint(save_root: Path) -> Path | None:
-    """Return the newest wav2vec2.ckpt under save_root/CKPT+*, or None."""
-    candidates = sorted(save_root.glob(f"CKPT+*/{_CKPT_FILENAME}"))
+    """Return the newest wav2vec2.ckpt anywhere under save_root, or None."""
+    candidates = sorted(save_root.rglob(_CKPT_FILENAME))
     return candidates[-1] if candidates else None
 
 
