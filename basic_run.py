@@ -22,9 +22,9 @@ The original repo pins torch 1.9.1, but we only need inference here, so
 the version drift is safe.
 
 Usage:
-    python hello_alt.py --ckpt path/to/wav2vec2.ckpt --audio path/to/file.wav
-    python hello_alt.py --ckpt path/to/wav2vec2.ckpt          # generates a 3s sine
-    python hello_alt.py --ckpt path/to/wav2vec2.ckpt --device cuda
+    python basic_run.py --ckpt path/to/wav2vec2.ckpt --audio path/to/file.wav
+    python basic_run.py --ckpt path/to/wav2vec2.ckpt          # generates a 3s sine
+    python basic_run.py --ckpt path/to/wav2vec2.ckpt --device cuda
 """
 
 from __future__ import annotations

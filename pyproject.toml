@@ -3,11 +3,11 @@ name = "wav2vec-alt-experiment"
 version = "0.1.0"
 description = "Inference harness for ALT/DALI singing-fine-tuned wav2vec2"
 authors = []
-readme = "README.md"
+readme = "HELLOWORLD.md"
 packages = [{include = "src"}]
 
 [tool.poetry.scripts]
-wav2vec-alt = "src.main:main"
+wav2vec-alt = "src.cli:main"
 
 [tool.poetry.dependencies]
 python = "^3.12"
@@ -17,6 +17,8 @@ transformers = ">=4.40,<5.0"
 soundfile = ">=0.12"
 tqdm = ">=4.0"
 gdown = ">=5.0"
+numpy = ">=1.24"
+matplotlib = ">=3.7"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0"
