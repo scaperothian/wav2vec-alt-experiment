@@ -15,14 +15,25 @@ Run everything through `poetry run` or activate the venv with `poetry shell`.
 
 ## Key facts
 
-- The checkpoint was saved by SpeechBrain, so weight keys are prefixed `model.` — `strip_speechbrain_prefix()` in `main.py` handles that.
-- `output_norm: true` in `hyperparams.yaml` means a `LayerNorm` is applied after the encoder; `main.py` mirrors this by default. Pass `--no-output-norm` to skip.
+- The checkpoint was saved by SpeechBrain, so weight keys are prefixed `model.` — `strip_speechbrain_prefix()` in `src/main.py` handles that.
+- `output_norm: true` in `hyperparams.yaml` means a `LayerNorm` is applied after the encoder; `src/main.py` mirrors this by default. Pass `--no-output-norm` to skip.
 - Base model is downloaded from HuggingFace on first run (~1.2 GB); subsequent runs use the local cache.
 - `model/` is gitignored — do not commit checkpoint files.
+
+## Checkpoint resolution (src/download.py)
+
+Checkpoints are resolved in this priority order:
+
+1. `--ckpt <path>` — explicit, validated to exist before use
+2. `model/save/CKPT+*/wav2vec2.ckpt` — auto-detected (newest CKPT+ dir wins)
+3. `wav2vec-alt-model.zip` in the project root — extracted into `model/save/downloaded/`, zip is left intact
+4. Google Drive download — `GDRIVE_MODEL_URL` in `src/download.py`, downloaded zip is deleted after extraction
 
 ## Commands
 
 ```bash
-poetry install                        # set up env
-poetry run wav2vec-alt --ckpt model/save/CKPT+2022-05-13+09-25-17+00/wav2vec2.ckpt
+poetry install                  # set up env
+poetry run wav2vec-alt          # run with auto-resolved checkpoint
+poetry run wav2vec-alt --audio /path/to/file.wav
+poetry run pytest               # run tests
 ```

@@ -47,3 +47,5 @@ poetry.lock
 
 # Model directory — kept locally, not tracked in git
 model/
+
+*.zip

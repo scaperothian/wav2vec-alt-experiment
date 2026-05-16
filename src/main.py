@@ -37,6 +37,8 @@ from pathlib import Path
 import torch
 from transformers import Wav2Vec2Model
 
+from src.download import resolve_checkpoint
+
 BASE_MODEL = "facebook/wav2vec2-large-960h-lv60-self"
 TARGET_SR = 16000
 EXPECTED_HIDDEN = 1024
@@ -96,9 +98,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--ckpt",
-        required=True,
+        required=False,
+        default=None,
         type=Path,
-        help="Path to wav2vec2.ckpt from the kept CKPT folder.",
+        help="Path to wav2vec2.ckpt. If omitted, auto-detects from model/save/ "
+        "or downloads from Google Drive.",
     )
     ap.add_argument(
         "--audio",
@@ -120,8 +124,10 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if not args.ckpt.exists():
-        print(f"ERROR: checkpoint not found: {args.ckpt}", file=sys.stderr)
+    try:
+        ckpt_path = resolve_checkpoint(args.ckpt)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
     if args.audio is not None and not args.audio.exists():
         print(f"ERROR: audio not found: {args.audio}", file=sys.stderr)
@@ -147,9 +153,9 @@ def main() -> int:
     print(f"      done in {time.time()-t0:.1f}s")
 
     # --- 2. Load the singing-tuned weights and strip SpeechBrain prefix ---
-    print(f"[2/4] Loading fine-tuned weights: {args.ckpt}")
+    print(f"[2/4] Loading fine-tuned weights: {ckpt_path}")
     t0 = time.time()
-    raw = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sd, n_stripped = strip_speechbrain_prefix(raw)
     print(f"      checkpoint keys: {len(raw)}  (stripped 'model.' prefix from {n_stripped})")
 
