@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "wav2vec-alt-experiment"
+version = "0.1.0"
+description = "Inference harness for ALT/DALI singing-fine-tuned wav2vec2"
+authors = []
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.scripts]
+wav2vec-alt = "src.main:main"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+torch = "2.7.0"
+torchaudio = "2.7.0"
+transformers = ">=4.40,<5.0"
+soundfile = ">=0.12"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
