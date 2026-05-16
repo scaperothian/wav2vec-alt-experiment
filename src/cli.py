@@ -1,241 +1,424 @@
-#!/usr/bin/env python3
 """
-hello_alt.py — minimal "does it work" script for the ALT_SpeechBrain
-DALI/ALT fine-tuned wav2vec2 encoder.
+wav2vec-sim: section prototype vs. all-frame similarity via wav2vec-alt embeddings.
 
-Loads the singing-fine-tuned wav2vec2 weights into a vanilla HuggingFace
-Wav2Vec2Model (bypassing SpeechBrain entirely), runs one audio file
-through it, and prints the resulting embedding shape and basic stats.
+For each probed transformer layer of the ALT/DALI singing-fine-tuned wav2vec2:
+  1. Compute raw window means across the full song.
+  2. Fit centering / ZCA-whitening from those means (both on by default).
+  3. Apply the transform, then L2-normalize, to get frame embeddings F.
+  4. Build section prototypes P by transforming each section's windows first,
+     averaging, then normalizing.  (Transform-before-average is critical:
+     averaging un-transformed windows re-introduces the song-mean we removed.)
+  5. Compute A = cosine_block(P, F) — [N_sections × N_frames].
+  6. Report argmax accuracy and mean off-diagonal prototype similarity.
+  7. Plot similarity scores as a line chart over time (enabled by default).
 
-What this matches in the original training code:
-    Their forward (compute_forward in train_wav2vec2_tb.py):
-        feats = self.modules.wav2vec2(wavs)
-    Their wav2vec2 wrapper (hyperparams.yaml):
-        speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2
-        source: facebook/wav2vec2-large-960h-lv60-self
-        output_norm: true   <-- we apply LayerNorm to match
-    So `feats` is the last hidden state of the HF Wav2Vec2Model,
-    followed by a LayerNorm over the hidden dim.
-
-Tested against PyTorch 2.7 + transformers >=4.30 + torchaudio >=2.2.
-The original repo pins torch 1.9.1, but we only need inference here, so
-the version drift is safe.
-
-Usage:
-    python hello_alt.py --ckpt path/to/wav2vec2.ckpt --audio path/to/file.wav
-    python hello_alt.py --ckpt path/to/wav2vec2.ckpt          # generates a 3s sine
-    python hello_alt.py --ckpt path/to/wav2vec2.ckpt --device cuda
+Probed layers default to [6, 12, 18, 24] (wav2vec2-large has 24 transformer
+layers; layer 0 is the CNN feature extractor output).
 """
-
-from __future__ import annotations
 
 import argparse
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
-from transformers import Wav2Vec2Model
 
-from src.download import resolve_checkpoint
+from .config import HOP_SEC, LAYERS_TO_PROBE, WAV2VEC_FRAME_RATE, WINDOW_SEC
+from .embed import embed_full_song, load_model
+from .io import load_audio, load_song
+from .plotting import (
+    _layer_mean_path,
+    _pairwise_path,
+    plot_layer_mean_similarity,
+    plot_prototype_similarity,
+    plot_section_grids,
+)
+from .similarity import cosine_block, cosine_matrix
+from .transform import apply_transform, fit_transform, l2_normalize_rows
+from .windows import (
+    frame_to_section_assignment,
+    section_windows,
+    whole_song_window_spans,
+    window_means,
+)
 
-BASE_MODEL = "facebook/wav2vec2-large-960h-lv60-self"
-TARGET_SR = 16000
-EXPECTED_HIDDEN = 1024
+AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
 
 
-def strip_speechbrain_prefix(state_dict: dict) -> dict:
+# ---------------------------------------------------------------------------
+# Per-layer analysis
+# ---------------------------------------------------------------------------
+
+def analyze_layer(
+    frames: torch.Tensor,
+    sections: list[dict],
+    all_spans: list[tuple[int, int]],
+    section_of: list[int],
+    layer_idx: int,
+    center: bool,
+    whiten: bool,
+    window: float = WINDOW_SEC,
+    hop: float = HOP_SEC,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    SpeechBrain's HuggingFaceWav2Vec2 wraps the HF model as
-    `self.model = Wav2Vec2Model(...)`, so the saved checkpoint keys are
-    prefixed `model.` (e.g. `model.encoder.layers.0.attention.k_proj.weight`).
-    HF's Wav2Vec2Model expects keys without that prefix. Strip it.
+    Build prototypes, frame embeddings, and prototype-vs-frame similarity
+    for one transformer layer, with optional centering and ZCA whitening.
+
+    Returns:
+        A: [N_sec, N_frames]  prototype-vs-frame cosine similarity
+        P: [N_sec, D]         section prototype embeddings (numpy)
+        F: [N_frames, D]      all-frame embeddings (numpy)
     """
-    new_sd = {}
-    n_stripped = 0
-    for k, v in state_dict.items():
-        if k.startswith("model."):
-            new_sd[k[len("model."):]] = v
-            n_stripped += 1
-        else:
-            new_sd[k] = v
-    return new_sd, n_stripped
+    F_raw = window_means(frames, all_spans)
+    section_raw = [
+        window_means(frames, list(section_windows(s["start"], s["stop"], window=window, hop=hop)))
+        for s in sections
+    ]
+
+    mu, W = fit_transform(F_raw, center=center, whiten=whiten)
+
+    F_norm = l2_normalize_rows(apply_transform(F_raw, mu, W))  # [N_frames, D]
+
+    prototypes = []
+    for raw_wins in section_raw:
+        if raw_wins.shape[0] == 0:
+            raise ValueError(
+                "A section produced zero windows — is WINDOW_SEC larger than "
+                "the section duration?"
+            )
+        transformed = apply_transform(raw_wins, mu, W)
+        proto = transformed.mean(dim=0, keepdim=True)
+        proto = l2_normalize_rows(proto).squeeze(0)
+        prototypes.append(proto)
+    P = torch.stack(prototypes)  # [N_sec, D]
+
+    A = cosine_block(P, F_norm)  # [N_sec, N_frames]
+
+    argmax = A.argmax(axis=0)
+    correct = sum(1 for k, gt in enumerate(section_of) if gt >= 0 and argmax[k] == gt)
+    total   = sum(1 for gt in section_of if gt >= 0)
+    acc     = f"{correct}/{total} = {correct / total:.1%}" if total else "n/a"
+
+    P_sim    = cosine_block(P, P)
+    n        = P_sim.shape[0]
+    mask     = ~np.eye(n, dtype=bool)
+    mean_off = float(P_sim[mask].mean()) if mask.any() else float("nan")
+
+    print(
+        f"  Layer {layer_idx}: argmax accuracy {acc}  |  "
+        f"mean off-diagonal prototype sim: {mean_off:.3f}"
+        + (" (lower = more separated)" if n > 1 else "")
+    )
+
+    return A, P.numpy(), F_norm.numpy()
 
 
-def load_audio_or_sine(audio_path: Path | None) -> torch.Tensor:
-    """
-    Returns a 1-D mono float32 waveform at TARGET_SR.
-    If audio_path is None, synthesizes a 3-second 440 Hz sine so this
-    script can be run for a sanity check without any audio file.
-    """
-    if audio_path is None:
-        duration_s = 3.0
-        t = torch.arange(int(duration_s * TARGET_SR), dtype=torch.float32) / TARGET_SR
-        wav = 0.1 * torch.sin(2 * torch.pi * 440.0 * t)
-        print(f"  (no --audio given; using synthetic 3 s 440 Hz sine)")
-        return wav
+# ---------------------------------------------------------------------------
+# Shared analysis core
+# ---------------------------------------------------------------------------
 
-    # Lazy import: torchaudio isn't strictly needed for the sine path.
-    import torchaudio
-
-    wav, sr_in = torchaudio.load(str(audio_path))  # (channels, samples), float32
-    print(f"  loaded: {audio_path}  shape={tuple(wav.shape)}  sr={sr_in}")
-
-    # Downmix to mono.
-    if wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-
-    # Resample to 16 kHz if needed.
-    if sr_in != TARGET_SR:
-        resampler = torchaudio.transforms.Resample(sr_in, TARGET_SR)
-        wav = resampler(wav)
-        print(f"  resampled {sr_in} -> {TARGET_SR}")
-
-    return wav.squeeze(0)  # (samples,)
+def _transform_tag(center: bool, whiten: bool) -> str:
+    if center and whiten:
+        return "centered+whitened"
+    if center:
+        return "centered"
+    return "baseline"
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
+def _run(
+    audio_path: Path,
+    sections: list[dict],
+    ckpt: Path | None,
+    apply_output_norm: bool,
+    device: str,
+    center: bool,
+    whiten: bool,
+    also_pairwise: bool,
+    plot: bool,
+    plot_output: Path | None,
+    save_npz: Path | None,
+    audio_name: str,
+    window: float = WINDOW_SEC,
+    hop: float = HOP_SEC,
+    smooth_k: int = 3,
+) -> None:
+    tag = _transform_tag(center, whiten)
+    print(f"Transform: {tag}  |  window={window}s  hop={hop}s")
+
+    model, output_layer_norm = load_model(ckpt, apply_output_norm, device)
+    wav = load_audio(audio_path)
+    duration = wav.shape[0] / 16_000
+    print(f"  Duration : {duration:.2f}s  ({wav.shape[0]:,} samples @ 16000 Hz)")
+
+    print("Running wav2vec2-alt inference...")
+    t0 = time.perf_counter()
+    hidden = embed_full_song(wav, model, output_layer_norm, device)
+    embed_time = time.perf_counter() - t0
+
+    n_layers, total_frames, hidden_dim = hidden.shape
+    print(
+        f"  Layers   : {n_layers}  |  Frames: {total_frames:,}  |  Dim: {hidden_dim}"
+    )
+    print(
+        f"  Time     : {embed_time:.1f}s  "
+        f"({duration / embed_time:.1f}× real-time)"
+    )
+
+    all_spans  = whole_song_window_spans(total_frames, window=window, hop=hop)
+    section_of = [frame_to_section_assignment(sp, sections) for sp in all_spans]
+    timestamps = np.array([(s + e) / 2 / WAV2VEC_FRAME_RATE for s, e in all_spans])
+
+    print("\nAnalysing layers:")
+    layer_A: dict[int, np.ndarray] = {}
+    layer_P: dict[int, np.ndarray] = {}
+    layer_F: dict[int, np.ndarray] = {}
+
+    for layer_idx in LAYERS_TO_PROBE:
+        if layer_idx >= hidden.shape[0]:
+            continue
+        A, P, F = analyze_layer(
+            hidden[layer_idx], sections, all_spans, section_of,
+            layer_idx, center, whiten, window=window, hop=hop,
+        )
+        layer_A[layer_idx] = A
+        layer_P[layer_idx] = P
+        layer_F[layer_idx] = F
+
+    # --- Build all plots, then show once ------------------------------------
+    if plot:
+        layer_results = {k: (layer_A[k], timestamps) for k in layer_A}
+        plot_prototype_similarity(
+            layer_results, sections, audio_name,
+            output_path=plot_output,
+            transform_tag=tag,
+        )
+        lm_output = _layer_mean_path(plot_output) if plot_output else None
+        plot_layer_mean_similarity(
+            layer_A, timestamps, sections, audio_name,
+            output_path=lm_output,
+            transform_tag=tag,
+            smooth_k=smooth_k,
+        )
+
+    # --- Section×section grid -----------------------------------------------
+    if also_pairwise:
+        section_labels = [s["label"][:20] for s in sections]
+        layer_grids = {
+            k: cosine_matrix(torch.from_numpy(layer_P[k]))
+            for k in layer_P
+        }
+        if plot:
+            grid_output = _pairwise_path(plot_output) if plot_output else None
+            plot_section_grids(layer_grids, section_labels, audio_name, grid_output)
+        if save_npz:
+            pairwise_npz = _pairwise_path(save_npz)
+            np.savez(str(pairwise_npz), **{f"layer{k}": v for k, v in layer_grids.items()})
+            print(f"Pairwise matrix saved to {pairwise_npz}")
+
+    # --- Show all interactive figures at once --------------------------------
+    if plot and not plot_output:
+        import matplotlib.pyplot as plt
+        try:
+            plt.show()
+        except KeyboardInterrupt:
+            plt.close("all")
+
+    # --- Save npz ------------------------------------------------------------
+    if save_npz:
+        flat: dict = {
+            "section_starts": np.array([s["start"] for s in sections]),
+            "section_stops":  np.array([s["stop"]  for s in sections]),
+            "timestamps":     timestamps,
+            "transform":      np.bytes_(tag),
+        }
+        for k in layer_A:
+            flat[f"layer{k}_A"] = layer_A[k]
+            flat[f"layer{k}_P"] = layer_P[k]
+            flat[f"layer{k}_F"] = layer_F[k]
+        np.savez(str(save_npz), **flat)
+        print(f"Results saved to {save_npz}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="wav2vec-sim",
+        description=(
+            "Section prototype vs. all-frame similarity via wav2vec-alt embeddings. "
+            "Mean-centering and ZCA whitening are applied by default to combat "
+            "embedding anisotropy. Plots similarity scores over time by default."
+        ),
+    )
+    p.add_argument(
+        "input",
+        help="Path to a ProPresenter JSON manifest OR an audio file (.wav, .mp3, …).",
+    )
+
+    # Checkpoint / model flags (wav2vec-alt specific)
+    p.add_argument(
         "--ckpt",
-        required=False,
         default=None,
         type=Path,
-        help="Path to wav2vec2.ckpt. If omitted, auto-detects from model/save/ "
-        "or downloads from Google Drive.",
+        metavar="PATH",
+        help=(
+            "Path to wav2vec2.ckpt. If omitted, auto-detected from model/save/, "
+            "extracted from wav2vec-alt-model.zip, or downloaded from Google Drive."
+        ),
     )
-    ap.add_argument(
-        "--audio",
-        type=Path,
-        default=None,
-        help="Path to an audio file (any format torchaudio supports). "
-        "Omit to use a synthetic sine wave.",
-    )
-    ap.add_argument(
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run inference on (default: cuda if available).",
-    )
-    ap.add_argument(
+    p.add_argument(
         "--no-output-norm",
         action="store_true",
-        help="Skip the final LayerNorm. The DALI yaml sets output_norm=true, "
-        "so by default we apply it to match.",
+        help=(
+            "Skip the final LayerNorm on the last transformer layer output. "
+            "The DALI yaml sets output_norm=true, so this is applied by default."
+        ),
     )
-    args = ap.parse_args()
+
+    # Transform flags (both on by default)
+    p.add_argument(
+        "--no-center",
+        action="store_true",
+        help="Disable song-mean centering (centering is on by default).",
+    )
+    p.add_argument(
+        "--no-whiten",
+        action="store_true",
+        help="Disable ZCA whitening (whitening is on by default).",
+    )
+
+    # Windowing parameters
+    p.add_argument(
+        "--window",
+        type=float,
+        default=WINDOW_SEC,
+        metavar="SEC",
+        help=(
+            f"Sliding window length in seconds (default: {WINDOW_SEC}). "
+            "Each embedding averages this many seconds of wav2vec2 frames."
+        ),
+    )
+    p.add_argument(
+        "--hop",
+        type=float,
+        default=HOP_SEC,
+        metavar="SEC",
+        help=(
+            f"Hop size between windows in seconds (default: {HOP_SEC}). "
+            "Controls how often a new embedding is computed."
+        ),
+    )
+
+    # Plot flags
+    p.add_argument(
+        "--smooth-k",
+        type=int,
+        default=3,
+        metavar="K",
+        help=(
+            "Smoothing window length for the layer-mean summary plot (default: 3). "
+            "Each point is averaged with the K-1 preceding points. "
+            "K=1 disables smoothing."
+        ),
+    )
+    p.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Suppress all matplotlib output.",
+    )
+    p.add_argument(
+        "--plot-output",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Save plots to FILE instead of displaying them. "
+            "The layer-mean summary is saved with a '_layermean' suffix. "
+            "When --also-pairwise is set, the section grid uses '_pairwise'."
+        ),
+    )
+    p.add_argument(
+        "--also-pairwise",
+        action="store_true",
+        help=(
+            "Compute the pooled section×section similarity grid and plot it. "
+            "If --save-npz is set, also saves the grid as a separate _pairwise.npz."
+        ),
+    )
+    p.add_argument(
+        "--save-npz",
+        default=None,
+        metavar="FILE",
+        help="Save similarity matrices and embeddings to a .npz file.",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    center = not args.no_center
+    whiten = not args.no_whiten
+    if whiten and not center:
+        parser.error("--no-center cannot be combined with whitening; "
+                     "add --no-whiten or remove --no-center.")
+
+    input_path = Path(args.input)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if input_path.suffix.lower() == ".json":
+        audio_path, sections = load_song(input_path)
+        audio_name = input_path.stem
+
+    elif input_path.suffix.lower() in AUDIO_SUFFIXES:
+        import torchaudio
+        info = torchaudio.info(str(input_path))
+        duration = info.num_frames / info.sample_rate
+        sections = [{"label": "full", "start": 0.0, "stop": duration}]
+        audio_path = input_path
+        audio_name = input_path.stem
+
+    else:
+        parser.error(
+            f"Unrecognised input '{input_path}'. "
+            f"Expected a .json or an audio file ({', '.join(sorted(AUDIO_SUFFIXES))})."
+        )
+        return
+
+    print(f"\nLoading wav2vec2-alt on {device}...")
+    print(f"Audio: {audio_path}")
+    print(f"Sections ({len(sections)}):")
+    for i, s in enumerate(sections):
+        print(f"  [{i}] {s['start']:6.2f}-{s['stop']:6.2f}s :: {s['label']}")
+    print()
 
     try:
-        ckpt_path = resolve_checkpoint(args.ckpt)
+        _run(
+            audio_path=audio_path,
+            sections=sections,
+            ckpt=args.ckpt,
+            apply_output_norm=not args.no_output_norm,
+            device=device,
+            center=center,
+            whiten=whiten,
+            also_pairwise=args.also_pairwise,
+            plot=not args.no_plot,
+            plot_output=Path(args.plot_output) if args.plot_output else None,
+            save_npz=Path(args.save_npz) if args.save_npz else None,
+            audio_name=audio_name,
+            window=args.window,
+            hop=args.hop,
+            smooth_k=args.smooth_k,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-    if args.audio is not None and not args.audio.exists():
-        print(f"ERROR: audio not found: {args.audio}", file=sys.stderr)
-        return 1
-
-    print(f"PyTorch:        {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"Device:         {args.device}")
-    print()
-
-    # --- 1. Build the architecture shell from the HF hub ---
-    # This downloads ~1.2 GB of the BASE model on first run. We only
-    # need it for the architecture + tensor shapes; we'll overwrite
-    # the weights immediately with the fine-tuned checkpoint.
-    print(f"[1/4] Loading base architecture: {BASE_MODEL}")
-    t0 = time.time()
-    model = Wav2Vec2Model.from_pretrained(BASE_MODEL)
-    print(f"      hidden size: {model.config.hidden_size}")
-    assert model.config.hidden_size == EXPECTED_HIDDEN, (
-        f"Unexpected hidden size {model.config.hidden_size}; this script "
-        f"assumes wav2vec2-large with hidden={EXPECTED_HIDDEN}."
-    )
-    print(f"      done in {time.time()-t0:.1f}s")
-
-    # --- 2. Load the singing-tuned weights and strip SpeechBrain prefix ---
-    print(f"[2/4] Loading fine-tuned weights: {ckpt_path}")
-    t0 = time.time()
-    raw = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    sd, n_stripped = strip_speechbrain_prefix(raw)
-    print(f"      checkpoint keys: {len(raw)}  (stripped 'model.' prefix from {n_stripped})")
-
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-
-    # The HF Wav2Vec2Model has a `masked_spec_embed` parameter that is
-    # used only during pretraining; the fine-tuned ckpt won't have it.
-    # That's the only "missing" key we expect — anything else is suspect.
-    benign_missing = {"masked_spec_embed"}
-    real_missing = [k for k in missing if k not in benign_missing]
-    if real_missing:
-        print(f"      WARNING: {len(real_missing)} unexpected missing keys:")
-        for k in real_missing[:5]:
-            print(f"        - {k}")
-        if len(real_missing) > 5:
-            print(f"        ... and {len(real_missing)-5} more")
-    if unexpected:
-        print(f"      WARNING: {len(unexpected)} unexpected keys in checkpoint:")
-        for k in unexpected[:5]:
-            print(f"        - {k}")
-    if not real_missing and not unexpected:
-        print(f"      state_dict loaded cleanly")
-    print(f"      done in {time.time()-t0:.1f}s")
-
-    # The DALI yaml has output_norm: true. SpeechBrain applies a
-    # LayerNorm over the hidden dim to the wav2vec2 output. We mirror
-    # that here. (HF's own model does NOT do this — output_norm is a
-    # SpeechBrain wrapper concept.)
-    apply_output_norm = not args.no_output_norm
-    output_layer_norm = torch.nn.LayerNorm(EXPECTED_HIDDEN) if apply_output_norm else None
-    if apply_output_norm:
-        # SpeechBrain's LayerNorm is freshly initialized (gamma=1, beta=0)
-        # at module construction. The checkpoint doesn't save it under a
-        # named key we can map to easily, but identity init is what
-        # gets used at inference for output_norm anyway in their wrapper
-        # path. If you find this is wrong, --no-output-norm disables it.
-        # See: speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2
-        pass
-
-    model.eval().to(args.device)
-    if output_layer_norm is not None:
-        output_layer_norm.eval().to(args.device)
-    print()
-
-    # --- 3. Load and prepare audio ---
-    print(f"[3/4] Preparing audio")
-    wav = load_audio_or_sine(args.audio)
-    # wav: (samples,) float32 in [-1, 1] at 16 kHz
-    print(f"      waveform: {wav.shape[0]} samples ({wav.shape[0]/TARGET_SR:.2f} s)  "
-          f"min={wav.min().item():.3f}  max={wav.max().item():.3f}")
-
-    # wav2vec2-large-960h-lv60-self uses do_normalize=True (zero-mean,
-    # unit-variance per-utterance). The SpeechBrain wrapper handles this
-    # via the HF feature extractor; we replicate the same normalization
-    # directly to avoid pulling in the feature extractor for one line.
-    wav = (wav - wav.mean()) / (wav.std() + 1e-7)
-
-    inputs = wav.unsqueeze(0).to(args.device)  # (1, samples)
-    print()
-
-    # --- 4. Forward pass ---
-    print(f"[4/4] Forward pass")
-    t0 = time.time()
-    with torch.inference_mode():
-        out = model(inputs)
-        hidden = out.last_hidden_state  # (1, T, 1024)
-        if output_layer_norm is not None:
-            hidden = output_layer_norm(hidden)
-    elapsed = time.time() - t0
-
-    print(f"      embedding shape:  {tuple(hidden.shape)}")
-    print(f"      dtype:            {hidden.dtype}")
-    print(f"      frames:           {hidden.shape[1]}  "
-          f"(~{hidden.shape[1] / (wav.shape[-1]/TARGET_SR):.2f} Hz frame rate)")
-    print(f"      mean / std:       {hidden.mean().item():+.4f} / {hidden.std().item():.4f}")
-    print(f"      forward time:     {elapsed*1000:.1f} ms on {args.device}")
-    print()
-    print("HELLO WORLD OK.")
-    return 0
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
